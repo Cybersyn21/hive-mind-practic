@@ -1,0 +1,344 @@
+// Модуль конфигурации CLI для команды solve
+// Извлечен из solve.mjs для поддержания размера файлов под 1500 строк
+
+// Этот модуль ожидает что 'use' будет передан из родительского модуля
+// чтобы избежать дублирования инициализации use-m
+
+// Примечание: строгая валидация опций теперь обрабатывается встроенным режимом yargs .strict()
+// Этот подход был принят согласно отзывам issue #482 для минимизации поддержки кастомного кода
+
+// Экспортируем функцию инициализации которая принимает 'use'
+export const initializeConfig = async (use) => {
+  // Импортируем yargs с конкретной версией для поддержки hideBin
+  const yargsModule = await use('yargs@17.7.2');
+  const yargs = yargsModule.default || yargsModule;
+  const { hideBin } = await use('yargs@17.7.2/helpers');
+
+  return { yargs, hideBin };
+};
+
+// Функция создания конфигурации yargs - избегает дублирования кода
+// Определяет все доступные опции командной строки для solve.mjs
+export const createYargsConfig = (yargsInstance) => {
+  return yargsInstance
+    .usage('Usage: solve.mjs <issue-url> [options]')
+    .command('$0 <issue-url>', 'Solve a GitHub issue or pull request', (yargs) => {
+      yargs.positional('issue-url', {
+        type: 'string',
+        description: 'The GitHub issue URL to solve'
+      });
+    })
+    .fail((msg, err) => {
+      // Кастомный обработчик ошибок для подавления вывода ошибок yargs
+      // Ошибки будут обработаны в блоке catch функции parseArguments
+      if (err) throw err; // Пробрасываем реальные ошибки
+      // Для ошибок валидации создаем чистый объект ошибки с сообщением
+      const error = new Error(msg);
+      error.name = 'YargsValidationError';
+      throw error;
+    })
+    // Опция для продолжения предыдущей сессии после достижения лимита
+    .option('resume', {
+      type: 'string',
+      description: 'Resume from a previous session ID (when limit was reached)',
+      alias: 'r'
+    })
+    // Режим dry-run: только подготовка команды без выполнения
+    .option('only-prepare-command', {
+      type: 'boolean',
+      description: 'Only prepare and print the claude command without executing it',
+    })
+    .option('dry-run', {
+      type: 'boolean',
+      description: 'Prepare everything but do not execute Claude (alias for --only-prepare-command)',
+      alias: 'n'
+    })
+    // Пропуск проверки подключения к инструменту (полезно в CI окружениях)
+    .option('skip-tool-connection-check', {
+      type: 'boolean',
+      description: 'Skip tool connection check (useful in CI environments). Does NOT skip model validation.',
+      default: false
+    })
+    .option('skip-tool-check', {
+      type: 'boolean',
+      description: 'Alias for --skip-tool-connection-check (deprecated, use --skip-tool-connection-check instead)',
+      default: false,
+      hidden: true
+    })
+    .option('skip-claude-check', {
+      type: 'boolean',
+      description: 'Alias for --skip-tool-connection-check (deprecated)',
+      default: false,
+      hidden: true
+    })
+    .option('tool-connection-check', {
+      type: 'boolean',
+      description: 'Perform tool connection check (enabled by default, use --no-tool-connection-check to skip). Does NOT affect model validation.',
+      default: true,
+      hidden: true
+    })
+    .option('tool-check', {
+      type: 'boolean',
+      description: 'Alias for --tool-connection-check (deprecated)',
+      default: true,
+      hidden: true
+    })
+    // Выбор модели AI с динамическими дефолтами в зависимости от выбранного инструмента
+    .option('model', {
+      type: 'string',
+      description: 'Model to use (for claude: opus, sonnet, haiku, haiku-3-5, haiku-3; for opencode: grok, gpt4o; for codex: gpt5, gpt5-codex, o3; for agent: grok, grok-code, big-pickle)',
+      alias: 'm',
+      default: (currentParsedArgs) => {
+        // Динамический дефолт на основе выбранного инструмента
+        if (currentParsedArgs?.tool === 'opencode') {
+          return 'grok-code-fast-1';
+        } else if (currentParsedArgs?.tool === 'codex') {
+          return 'gpt-5';
+        } else if (currentParsedArgs?.tool === 'agent') {
+          return 'grok-code';
+        }
+        return 'sonnet';
+      }
+    })
+    .option('auto-pull-request-creation', {
+      type: 'boolean',
+      description: 'Automatically create a draft pull request before running Claude',
+      default: true
+    })
+    .option('verbose', {
+      type: 'boolean',
+      description: 'Enable verbose logging for debugging',
+      alias: 'v',
+      default: false
+    })
+    .option('fork', {
+      type: 'boolean',
+      description: 'Fork the repository if you don\'t have write access',
+      alias: 'f',
+      default: false
+    })
+    .option('auto-fork', {
+      type: 'boolean',
+      description: 'Automatically fork public repositories without write access (fails for private repos)',
+      default: true
+    })
+    .option('attach-logs', {
+      type: 'boolean',
+      description: 'Upload the solution draft log file to the Pull Request on completion (⚠️ WARNING: May expose sensitive data)',
+      default: false
+    })
+    .option('auto-close-pull-request-on-fail', {
+      type: 'boolean',
+      description: 'Automatically close the pull request if execution fails',
+      default: false
+    })
+    .option('auto-continue', {
+      type: 'boolean',
+      description: 'Continue with existing PR when issue URL is provided (instead of creating new PR)',
+      default: true
+    })
+    .option('auto-continue-on-limit-reset', {
+      type: 'boolean',
+      description: 'Automatically continue when AI tool limit resets (calculates reset time and waits)',
+      default: false
+    })
+    .option('auto-resume-on-errors', {
+      type: 'boolean',
+      description: 'Automatically resume on network errors (503, etc.) with exponential backoff',
+      default: false
+    })
+    .option('auto-continue-only-on-new-comments', {
+      type: 'boolean',
+      description: 'Explicitly fail on absence of new comments in auto-continue or continue mode',
+      default: false
+    })
+    .option('auto-commit-uncommitted-changes', {
+      type: 'boolean',
+      description: 'Automatically commit and push uncommitted changes made by Claude (disabled by default)',
+      default: false
+    })
+    .option('auto-restart-on-uncommitted-changes', {
+      type: 'boolean',
+      description: 'Automatically restart when uncommitted changes are detected to allow the tool to handle them (default: true, use --no-auto-restart-on-uncommitted-changes to disable)',
+      default: true
+    })
+    .option('auto-restart-max-iterations', {
+      type: 'number',
+      description: 'Maximum number of auto-restart iterations when uncommitted changes are detected (default: 3)',
+      default: 3
+    })
+    .option('continue-only-on-feedback', {
+      type: 'boolean',
+      description: 'Only continue if feedback is detected (works only with pull request link or issue link with --auto-continue)',
+      default: false
+    })
+    .option('watch', {
+      type: 'boolean',
+      description: 'Monitor continuously for feedback and auto-restart when detected (stops when PR is merged)',
+      alias: 'w',
+      default: false
+    })
+    .option('watch-interval', {
+      type: 'number',
+      description: 'Interval in seconds for checking feedback in watch mode (default: 60)',
+      default: 60
+    })
+    .option('min-disk-space', {
+      type: 'number',
+      description: 'Minimum required disk space in MB (default: 500)',
+      default: 500
+    })
+    .option('log-dir', {
+      type: 'string',
+      description: 'Directory to save log files (defaults to current working directory)',
+      alias: 'l'
+    })
+    .option('think', {
+      type: 'string',
+      description: 'Thinking level: low (Think.), medium (Think hard.), high (Think harder.), max (Ultrathink.)',
+      choices: ['low', 'medium', 'high', 'max'],
+      default: undefined
+    })
+    .option('base-branch', {
+      type: 'string',
+      description: 'Target branch for the pull request (defaults to repository default branch)',
+      alias: 'b'
+    })
+    .option('sentry', {
+      type: 'boolean',
+      description: 'Enable Sentry error tracking and monitoring (use --no-sentry to disable)',
+      default: true
+    })
+    .option('auto-cleanup', {
+      type: 'boolean',
+      description: 'Automatically delete temporary working directory on completion (error, success, or CTRL+C). Default: true for private repos, false for public repos. Use explicit flag to override.',
+      default: undefined
+    })
+    .option('auto-merge-default-branch-to-pull-request-branch', {
+      type: 'boolean',
+      description: 'Automatically merge the default branch to the pull request branch when continuing work (only in continue mode)',
+      default: false
+    })
+    .option('allow-fork-divergence-resolution-using-force-push-with-lease', {
+      type: 'boolean',
+      description: 'Allow automatic force-push (--force-with-lease) when fork diverges from upstream (DANGEROUS: can overwrite fork history)',
+      default: false
+    })
+    .option('allow-to-push-to-contributors-pull-requests-as-maintainer', {
+      type: 'boolean',
+      description: 'When continuing a fork PR as a maintainer, attempt to push directly to the contributor\'s fork if "Allow edits by maintainers" is enabled. Requires --auto-fork to be enabled.',
+      default: false
+    })
+    .option('prefix-fork-name-with-owner-name', {
+      type: 'boolean',
+      description: 'Prefix fork name with original owner name (e.g., "owner-repo" instead of "repo"). Useful when forking repositories with same name from different owners.',
+      default: true
+    })
+    .option('tool', {
+      type: 'string',
+      description: 'AI tool to use for solving issues',
+      choices: ['claude', 'opencode', 'codex', 'agent'],
+      default: 'claude'
+    })
+    .option('interactive-mode', {
+      type: 'boolean',
+      description: '[EXPERIMENTAL] Post Claude output as PR comments in real-time. Only supported for --tool claude.',
+      default: false
+    })
+    .parserConfiguration({
+      'boolean-negation': true
+    })
+    // Use yargs built-in strict mode to reject unrecognized options
+    // This prevents issues like #453 and #482 where unknown options are silently ignored
+    .strict()
+    .help('h')
+    .alias('h', 'help');
+};
+
+// Парсинг аргументов командной строки - теперь требует переданные yargs и hideBin
+// Обрабатывает все флаги и опции, выполняет валидацию и нормализацию
+export const parseArguments = async (yargs, hideBin) => {
+  const rawArgs = hideBin(process.argv);
+  // Используем .parse() вместо .argv чтобы режим .strict() работал корректно
+  // Когда вызываешь yargs(args) и используешь .argv, strict mode не срабатывает
+  // См: https://github.com/yargs/yargs/issues - .strict() работает только с .parse()
+
+  let argv;
+  try {
+    // Подавляем вывод stderr от yargs во время парсинга чтобы предотвратить появление ошибок валидации
+    // Это предотвращает загрязнение stderr сообщениями "YError: Not enough arguments" (issue #583)
+    // Сохраняем оригинальный stderr.write
+    const originalStderrWrite = process.stderr.write;
+    const stderrBuffer = [];
+
+    // Временно переопределяем stderr.write для захвата вывода
+    process.stderr.write = function(chunk, encoding, callback) {
+      stderrBuffer.push(chunk.toString());
+      // Вызываем callback если предоставлен (для совместимости)
+      if (typeof encoding === 'function') {
+        encoding();
+      } else if (typeof callback === 'function') {
+        callback();
+      }
+      return true;
+    };
+
+    try {
+      argv = await createYargsConfig(yargs()).parse(rawArgs);
+    } finally {
+      // Всегда восстанавливаем stderr.write
+      process.stderr.write = originalStderrWrite;
+
+      // В режиме verbose показываем что было захвачено из stderr (для отладки)
+      if (global.verboseMode && stderrBuffer.length > 0) {
+        const captured = stderrBuffer.join('');
+        if (captured.trim()) {
+          console.error('[Suppressed yargs stderr]:', captured);
+        }
+      }
+    }
+  } catch (error) {
+    // Yargs выбрасывает ошибки для проблем валидации
+    // Если ошибка о неизвестных аргументах (strict mode), пробрасываем её
+    if (error.message && error.message.includes('Unknown arguments')) {
+      throw error;
+    }
+    // Для других ошибок валидации показываем предупреждение в verbose режиме
+    if (error.message && global.verboseMode) {
+      console.error('Yargs parsing warning:', error.message);
+    }
+    // Пытаемся получить argv даже при ошибке
+    argv = error.argv || {};
+  }
+
+  // Пост-обработка: исправляем дефолтные значения модели для opencode и codex
+  // Yargs не корректно обрабатывает динамические дефолты на основе других аргументов,
+  // поэтому нам нужно обработать это вручную после парсинга
+  const modelExplicitlyProvided = rawArgs.includes('--model') || rawArgs.includes('-m');
+
+  // Нормализуем устаревшие флаги: legacy --skip-tool-check и --skip-claude-check работают как --skip-tool-connection-check
+  if (argv) {
+    // Поддержка устаревших флагов
+    if (argv.skipToolCheck || argv.skipClaudeCheck) {
+      argv.skipToolConnectionCheck = true;
+    }
+    // Поддержка отрицательного устаревшего флага: --no-tool-check становится --no-tool-connection-check
+    if (argv.toolCheck === false) {
+      argv.toolConnectionCheck = false;
+    }
+  }
+
+  // Устанавливаем правильные дефолтные модели для каждого инструмента если модель не указана явно
+  if (argv.tool === 'opencode' && !modelExplicitlyProvided) {
+    // Пользователь не указал --model явно, используем правильный дефолт для opencode
+    argv.model = 'grok-code-fast-1';
+  } else if (argv.tool === 'codex' && !modelExplicitlyProvided) {
+    // Пользователь не указал --model явно, используем правильный дефолт для codex
+    argv.model = 'gpt-5';
+  } else if (argv.tool === 'agent' && !modelExplicitlyProvided) {
+    // Пользователь не указал --model явно, используем правильный дефолт для agent
+    argv.model = 'grok-code';
+  }
+
+  return argv;
+};
